@@ -62,6 +62,16 @@ def init_db() -> None:
             )
             """
         )
+        _ = conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS processed_messages (
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (chat_id, message_id)
+            )
+            """
+        )
     logger.info("SQLite initialized at path=%s", DB_PATH)
 
 
@@ -72,10 +82,38 @@ def get_user_name(user) -> str:
     return name or f"user_{user.id}"
 
 
-def add_hookah_and_get_score(chat_id: int, user) -> list[tuple[str, int]]:
+def add_hookah_and_get_score(chat_id: int, message_id: int, user) -> tuple[list[tuple[str, int]], bool]:
     user_name = get_user_name(user)
-    logger.info("Count +1: chat_id=%s user_id=%s user=%s", chat_id, user.id, user_name)
+    logger.info(
+        "Count +1 request: chat_id=%s message_id=%s user_id=%s user=%s",
+        chat_id,
+        message_id,
+        user.id,
+        user_name,
+    )
     with sqlite3.connect(DB_PATH) as conn:
+        # Idempotency on restarts/retries: one message can be counted only once.
+        dedup_result = conn.execute(
+            """
+            INSERT OR IGNORE INTO processed_messages (chat_id, message_id)
+            VALUES (?, ?)
+            """,
+            (chat_id, message_id),
+        )
+        is_new_message = dedup_result.rowcount == 1
+        if not is_new_message:
+            logger.info("Duplicate message ignored: chat_id=%s message_id=%s", chat_id, message_id)
+            rows = conn.execute(
+                """
+                SELECT user_name, count
+                FROM hookah_stats
+                WHERE chat_id = ?
+                ORDER BY count DESC, user_name ASC
+                """,
+                (chat_id,),
+            ).fetchall()
+            return rows, False
+
         _ = conn.execute(
             """
             INSERT INTO hookah_stats (chat_id, user_id, user_name, count)
@@ -96,7 +134,7 @@ def add_hookah_and_get_score(chat_id: int, user) -> list[tuple[str, int]]:
             (chat_id,),
         ).fetchall()
     logger.info("Score updated: chat_id=%s users=%s", chat_id, len(rows))
-    return rows
+    return rows, True
 
 
 def get_score(chat_id: int) -> list[tuple[str, int]]:
@@ -132,9 +170,12 @@ def has_image(message) -> bool:
 async def on_hookah_message(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     chat = update.effective_chat
-    user = update.effective_user
 
-    if not message or not chat or not user:
+    if not message or not chat:
+        return
+    user = message.from_user
+    if not user:
+        logger.warning("Skip message without from_user: chat_id=%s message_id=%s", chat.id, message.message_id)
         return
 
     text = (message.caption or "") + " " + (message.text or "")
@@ -144,8 +185,9 @@ async def on_hookah_message(update: Update, _context: ContextTypes.DEFAULT_TYPE)
     if not PLUS_ONE_RE.search(text):
         return
 
-    rows = add_hookah_and_get_score(chat.id, user)
-    _ = await message.reply_text(format_score(rows))
+    rows, was_counted = add_hookah_and_get_score(chat.id, message.message_id, user)
+    if was_counted:
+        _ = await message.reply_text(format_score(rows))
 
 
 async def stats(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
