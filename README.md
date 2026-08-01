@@ -75,3 +75,13 @@ cd /Users/iliabukin/Desktop/micro_bots/nargila-counter
 Перед деплоем убедись, что коммиты запушены в `origin/master` — скрипт делает
 `git fetch + git reset --hard origin/master` на сервере, а не тащит локальные
 изменения с Mac.
+
+### Volume
+
+Данные счёта живут в Docker-volume **`nargila-counter-data`** (примонтирован к
+`/data`, SQLite в `/data/hookah.db`). Это имя зашито в `deploy.sh` как
+`DATA_VOLUME` и **намеренно не выводится из `CONTAINER_NAME`**: производное имя
+`nargila-counter-bot-data` однажды создало пустую БД и сбросило счёт.
+Если имя контейнера или образа меняется — volume должен остаться прежним.
+
+Старые бэкапы БД лежат рядом как `hookah.db.bak.<timestamp>` в том же volume.

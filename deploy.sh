@@ -20,6 +20,11 @@ REMOTE_DIR="/home/casaos/nargila-counter"  # repo path on the server (absolute, 
 MODE="run"                               # single container, no compose file
 CONTAINER_NAME="nargila-counter-bot"
 IMAGE_NAME="nargila-counter-bot"
+# IMPORTANT: this name must match the volume the original deployment created.
+# Do NOT derive it from CONTAINER_NAME — that produced
+# "nargila-counter-bot-data" and silently created an empty DB, dropping all
+# historical scores. Keep it pinned to "nargila-counter-data".
+DATA_VOLUME="nargila-counter-data"          # pinned to the original volume (see README "Volume" note)
 ENV_FILE_ON_SERVER="$REMOTE_DIR/.env"    # read by `docker run --env-file`
 RUN_MIGRATIONS=false                     # no Alembic for this project
 GIT_BRANCH="master"
@@ -62,7 +67,7 @@ $DOCKER run -d \
   --name "$CONTAINER_NAME" \
   --restart unless-stopped \
   --env-file "$ENV_FILE_ON_SERVER" \
-  -v "${CONTAINER_NAME}-data:/data" \
+  -v "${DATA_VOLUME}:/data" \
   "$IMAGE_NAME"
 
 echo "-- container status --"
