@@ -9,6 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# Local secrets (deploy uses ~/nargila-counter/.env on the server only)
+.env
+
 # Local SQLite files
 *.db
 
