@@ -4,4 +4,21 @@ version = "0.1.0"
 description = "Telegram bot that counts hookahs by users"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["python-telegram-bot>=22.0"]
+dependencies = ["python-telegram-bot[job-queue]==22.7"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 90
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = ["E501"]  # line length handled by formatter
