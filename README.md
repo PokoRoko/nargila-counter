@@ -45,3 +45,33 @@ docker run -d \
   -v nargila-counter-data:/data \
   nargila-counter-bot
 ```
+
+## Деплой на CasaOS
+
+Деплой идёт через `deploy.sh` в корне репозитория. Скрипт запускается **локально
+на Mac** и управляет сервером CasaOS по SSH (хост-алиас `casaos` из `~/.ssh/config`).
+Секреты хранятся **только на сервере** в `~/nargila-counter/.env` (см. `.env.example`),
+в git их нет.
+
+Один раз настроить сервер: склонировать репозиторий и положить `.env`
+с `TELEGRAM_BOT_TOKEN` в `~/nargila-counter/`.
+
+Обычный цикл релиза (локально на Mac):
+
+```bash
+cd /Users/iliabukin/Desktop/micro_bots/nargila-counter
+./deploy.sh            # build + restart
+./deploy.sh logs       # follow logs
+./deploy.sh status     # docker ps
+```
+
+Прочие команды:
+
+```bash
+./deploy.sh stop       # остановить контейнер
+./deploy.sh ssh        # интерактивный шелл на сервере в ~/nargila-counter
+```
+
+Перед деплоем убедись, что коммиты запушены в `origin/master` — скрипт делает
+`git fetch + git reset --hard origin/master` на сервере, а не тащит локальные
+изменения с Mac.
