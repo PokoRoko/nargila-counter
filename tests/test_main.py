@@ -335,3 +335,490 @@ class TestTimezone:
 
         with pytest.raises(ZoneInfoNotFoundError):
             ZoneInfo("Not/A/Real/Zone")
+
+
+# ---------------------------------------------------------------------------
+# Handler-level integration tests
+#
+# These exercise the bot's user-facing behaviour (the 4 rules the owner
+# documented) end to end against a temp DB: photo +1 replies with the weekly
+# score, /stats shows the all-time total + win counts, and the weekly/monthly
+# winner announcement picks whoever smoked the least in the previous period.
+#
+# Coroutine handlers are run synchronously via asyncio.run — no need for
+# pytest-asyncio. Handlers only duck-type attributes on Update/Message/Chat,
+# so SimpleNamespace doubles are enough.
+# ---------------------------------------------------------------------------
+import asyncio  # noqa: E402
+
+
+def _run(coro):
+    """Run an async handler coroutine to completion in a fresh event loop."""
+    return asyncio.run(coro)
+
+
+def _make_msg(
+    *,
+    chat_id: int,
+    message_id: int,
+    user,
+    text: str = "",
+    caption: str = "",
+    photo=None,
+    document=None,
+):
+    """Build a minimal Update/Message/Chat triple that handlers duck-type.
+
+    `photo=None` means 'no photo'. Setting photo=True makes `bool(photo)` truthy
+    (handlers check `if message.photo:`). We don't need real PhotoSize objects.
+    """
+    photo_obj = None if photo is None else photo  # truthy sentinel is enough
+    chat = SimpleNamespace(id=chat_id)
+    replies: list[str] = []
+
+    async def reply_text(text, **_kwargs):
+        replies.append(text)
+        return None
+
+    message = SimpleNamespace(
+        message_id=message_id,
+        from_user=user,
+        chat=chat,
+        text=text,
+        caption=caption,
+        photo=photo_obj,
+        document=document,
+        reply_text=reply_text,
+    )
+    update = SimpleNamespace(effective_message=message, effective_chat=chat)
+    return update, message, replies
+
+
+def _make_context(*, args=None, bot=None):
+    """Build a minimal ContextTypes.DEFAULT_TYPE double."""
+    sent: list[tuple[int, str]] = []
+
+    class _Bot:
+        async def send_message(self, chat_id, text):
+            sent.append((chat_id, text))
+            return None
+
+    return SimpleNamespace(args=args or [], bot=bot or _Bot()), sent
+
+
+class TestPhotoHandlerShowsWeeklyScore:
+    """Rule 3: при отправке фото показывается статистика только за эту неделю."""
+
+    def test_photo_reply_uses_weekly_title(self, temp_db):
+        user = _make_user(100, username="alice")
+        update, _msg, replies = _make_msg(
+            chat_id=1, message_id=10, user=user, photo=True, caption="+1"
+        )
+        context, _ = _make_context()
+        _run(main.on_hookah_message(update, context))
+
+        assert len(replies) == 1
+        reply = replies[0]
+        # Weekly title, NOT the all-time "Общий счёт" one
+        assert "эту неделю" in reply.lower()
+        assert "общий счёт" not in reply.lower()
+        assert "🥇 @alice — 1" in reply
+
+    def test_photo_reply_excludes_old_weeks(self, temp_db):
+        """A +1 from 2 weeks ago must not appear in the weekly reply."""
+        alice = _make_user(1, username="alice")
+        bob = _make_user(2, username="bob")
+
+        # Bob: 3 this week (current created_at)
+        for mid in (10, 11, 12):
+            update, _m, _r = _make_msg(
+                chat_id=1, message_id=mid, user=bob, photo=True, caption="+1"
+            )
+            context, _ = _make_context()
+            _run(main.on_hookah_message(update, context))
+
+        # Alice: 1 this week
+        update, _m, replies = _make_msg(
+            chat_id=1, message_id=20, user=alice, photo=True, caption="+1"
+        )
+        context, _ = _make_context()
+        _run(main.on_hookah_message(update, context))
+
+        # Inject an OLD log entry (2 weeks ago) that must be ignored
+        two_weeks_ago = (main._week_start() - timedelta(weeks=2)).isoformat()
+        with sqlite3.connect(temp_db) as conn:
+            conn.execute(
+                "INSERT INTO hookah_log (chat_id, user_id, user_name, created_at) "
+                "VALUES (1, 1, '@alice', ?)",
+                (two_weeks_ago,),
+            )
+
+        # Trigger one more +1 for alice and inspect the weekly reply
+        update, _m, replies = _make_msg(
+            chat_id=1, message_id=21, user=alice, photo=True, caption="+1"
+        )
+        context, _ = _make_context()
+        _run(main.on_hookah_message(update, context))
+
+        reply = replies[0]
+        # This week: alice 2 (old excluded), bob 3. Alice ranks first (anti-rating).
+        assert "🥇 @alice — 2" in reply
+        assert "🥈 @bob — 3" in reply
+        # And it must NOT show the cumulative total (alice 2, not alice 3+)
+        assert "🥉" not in reply  # only 2 users this week
+
+    def test_photo_without_plus_one_is_ignored(self, temp_db):
+        """A photo without +1 in caption/text must not trigger any reply."""
+        user = _make_user(100, username="alice")
+        update, _msg, replies = _make_msg(
+            chat_id=1, message_id=10, user=user, photo=True, caption="nice photo"
+        )
+        context, _ = _make_context()
+        _run(main.on_hookah_message(update, context))
+        assert replies == []
+
+    def test_text_without_photo_is_ignored(self, temp_db):
+        """A plain +1 text without a photo must not trigger any reply."""
+        user = _make_user(100, username="alice")
+        update, _msg, replies = _make_msg(
+            chat_id=1, message_id=10, user=user, photo=None, text="+1"
+        )
+        context, _ = _make_context()
+        _run(main.on_hookah_message(update, context))
+        assert replies == []
+
+    def test_duplicate_plus_one_does_not_reply_again(self, temp_db):
+        """Re-sending the same +1 photo (same message_id) is ignored."""
+        user = _make_user(100, username="alice")
+        first = _make_msg(
+            chat_id=1, message_id=10, user=user, photo=True, caption="+1"
+        )
+        second = _make_msg(
+            chat_id=1, message_id=10, user=user, photo=True, caption="+1"
+        )
+        context, _ = _make_context()
+        _run(main.on_hookah_message(first[0], context))   # 1 reply
+        _run(main.on_hookah_message(second[0], context))  # no extra reply
+        assert len(first[2]) == 1
+        assert second[2] == []
+
+
+class TestStatsCommand:
+    """Rule 4: /stats -> общий счёт + победы по каждому пользователю."""
+
+    def test_stats_shows_all_time_total(self, temp_db):
+        alice = _make_user(1, username="alice")
+        bob = _make_user(2, username="bob")
+        for mid in (10, 11, 12):
+            main.add_hookah_and_get_score(1, mid, alice)  # 3
+        main.add_hookah_and_get_score(1, 20, bob)        # 1
+
+        update, _m, replies = _make_msg(chat_id=1, message_id=99, user=alice)
+        context, _ = _make_context(args=[])
+        _run(main.stats(update, context))
+
+        assert len(replies) == 1
+        out = replies[0]
+        # All-time title and both users
+        assert "общий счёт" in out.lower()
+        assert "🥇 @bob — 1" in out   # anti-rating: bob (1) above alice (3)
+        assert "🥈 @alice — 3" in out
+
+    def test_stats_with_no_history_says_nothing(self, temp_db):
+        user = _make_user(1, username="alice")
+        update, _m, replies = _make_msg(chat_id=1, message_id=1, user=user)
+        context, _ = _make_context(args=[])
+        _run(main.stats(update, context))
+        assert replies == ["Пока нет записей."]
+
+    def test_stats_shows_win_counts_section_when_present(self, temp_db):
+        alice = _make_user(1, username="alice")
+        bob = _make_user(2, username="bob")
+        main.add_hookah_and_get_score(1, 10, alice)  # 1
+        main.add_hookah_and_get_score(1, 20, bob)    # 1
+
+        # Seed a recorded weekly win for alice
+        main.save_period_winner(1, "week", main._week_start().isoformat(), 1, "@alice", 1)
+        # And a monthly win for bob
+        main.save_period_winner(1, "month", main._month_start().isoformat(), 2, "@bob", 1)
+
+        update, _m, replies = _make_msg(chat_id=1, message_id=99, user=alice)
+        context, _ = _make_context(args=[])
+        _run(main.stats(update, context))
+
+        out = replies[0]
+        assert "Победы" in out
+        # Each user gets one line showing BOTH week and month win counts
+        # (zeros included), e.g. "@alice: недель — 1, месяцев — 0".
+        assert "@alice: недель — 1, месяцев — 0" in out
+        assert "@bob: недель — 0, месяцев — 1" in out
+
+    def test_stats_omits_win_section_when_no_winners(self, temp_db):
+        """No period_winners rows -> no 'Победы' section at all."""
+        alice = _make_user(1, username="alice")
+        main.add_hookah_and_get_score(1, 10, alice)
+
+        update, _m, replies = _make_msg(chat_id=1, message_id=99, user=alice)
+        context, _ = _make_context(args=[])
+        _run(main.stats(update, context))
+
+        assert "Победы" not in replies[0]
+
+    def test_stats_week_arg_shows_weekly(self, temp_db):
+        alice = _make_user(1, username="alice")
+        main.add_hookah_and_get_score(1, 10, alice)  # 1 this week
+
+        update, _m, replies = _make_msg(chat_id=1, message_id=99, user=alice)
+        context, _ = _make_context(args=["week"])
+        _run(main.stats(update, context))
+
+        assert "текущую неделю" in replies[0].lower()
+        assert "🥇 @alice — 1" in replies[0]
+
+    def test_stats_month_arg_shows_monthly(self, temp_db):
+        alice = _make_user(1, username="alice")
+        main.add_hookah_and_get_score(1, 10, alice)
+
+        update, _m, replies = _make_msg(chat_id=1, message_id=99, user=alice)
+        context, _ = _make_context(args=["month"])
+        _run(main.stats(update, context))
+
+        assert "текущий месяц" in replies[0].lower()
+
+    @pytest.mark.parametrize("alias", ["w", "week", "неделя", "неделю", "нед"])
+    def test_week_aliases_accepted(self, temp_db, alias):
+        alice = _make_user(1, username="alice")
+        main.add_hookah_and_get_score(1, 10, alice)  # seed a record this week
+        update, _m, replies = _make_msg(chat_id=1, message_id=99, user=alice)
+        context, _ = _make_context(args=[alias])
+        _run(main.stats(update, context))
+        assert "текущую неделю" in replies[0].lower()
+
+    @pytest.mark.parametrize("alias", ["m", "month", "месяц", "мес"])
+    def test_month_aliases_accepted(self, temp_db, alias):
+        alice = _make_user(1, username="alice")
+        main.add_hookah_and_get_score(1, 10, alice)  # seed a record this month
+        update, _m, replies = _make_msg(chat_id=1, message_id=99, user=alice)
+        context, _ = _make_context(args=[alias])
+        _run(main.stats(update, context))
+        assert "текущий месяц" in replies[0].lower()
+
+
+class TestWeeklyAndMonthlyPeriodStart:
+    """Rule 1: отсчёт идёт с понедельника и первого числа месяца."""
+
+    @pytest.mark.parametrize(
+        "today,expected_monday",
+        [
+            (date(2026, 8, 3), date(2026, 8, 3)),   # Monday -> same
+            (date(2026, 8, 4), date(2026, 8, 3)),   # Tuesday
+            (date(2026, 8, 6), date(2026, 8, 3)),   # Thursday (today)
+            (date(2026, 8, 9), date(2026, 8, 3)),   # Sunday -> back to Mon
+            (date(2026, 8, 10), date(2026, 8, 10)), # next Monday
+        ],
+    )
+    def test_week_start_is_monday(self, today, expected_monday):
+        assert main._week_start(today) == expected_monday
+        assert expected_monday.weekday() == 0  # always Monday
+
+    @pytest.mark.parametrize(
+        "today,expected_first",
+        [
+            (date(2026, 1, 1), date(2026, 1, 1)),
+            (date(2026, 1, 15), date(2026, 1, 1)),
+            (date(2026, 1, 31), date(2026, 1, 1)),
+            (date(2026, 2, 28), date(2026, 2, 1)),
+            (date(2026, 12, 31), date(2026, 12, 1)),
+        ],
+    )
+    def test_month_start_is_first(self, today, expected_first):
+        assert main._month_start(today) == expected_first
+        assert expected_first.day == 1
+
+    def test_get_period_score_week_uses_monday_boundary(self, temp_db):
+        """A log entry on Sunday just before this Monday must be EXCLUDED."""
+        alice = _make_user(1, username="alice")
+        main.add_hookah_and_get_score(1, 10, alice)  # this week
+
+        # Last Sunday (just before this week's Monday)
+        this_monday = main._week_start()
+        last_sunday = this_monday - timedelta(days=1)
+        with sqlite3.connect(temp_db) as conn:
+            conn.execute(
+                "INSERT INTO hookah_log (chat_id, user_id, user_name, created_at) "
+                "VALUES (1, 2, '@bob', ?)",
+                (last_sunday.isoformat(),),
+            )
+
+        rows = dict(main.get_period_score(1, "week"))
+        # Bob's Sunday entry is in the previous week, must not count here.
+        assert rows == {"@alice": 1}
+
+    def test_get_period_score_month_uses_first_of_month_boundary(self, temp_db):
+        """A log entry on the last day of the previous month is excluded."""
+        alice = _make_user(1, username="alice")
+        main.add_hookah_and_get_score(1, 10, alice)  # this month
+
+        # Last day of previous month
+        first_of_this_month = main._month_start()
+        last_day_prev = first_of_this_month - timedelta(days=1)
+        with sqlite3.connect(temp_db) as conn:
+            conn.execute(
+                "INSERT INTO hookah_log (chat_id, user_id, user_name, created_at) "
+                "VALUES (1, 2, '@bob', ?)",
+                (last_day_prev.isoformat(),),
+            )
+
+        rows = dict(main.get_period_score(1, "month"))
+        assert rows == {"@alice": 1}
+
+
+class TestPeriodWinnerAnnouncement:
+    """Rule 2: в конце каждой недели и месяца отчёт с победителем (меньше всех)."""
+
+    def test_determine_winner_picks_fewest(self, temp_db):
+        alice = _make_user(1, username="alice")
+        bob = _make_user(2, username="bob")
+        carol = _make_user(3, username="carol")
+        # alice 3, bob 1, carol 2 -> bob wins (fewest)
+        for mid in (10, 11, 12):
+            main.add_hookah_and_get_score(1, mid, alice)
+        main.add_hookah_and_get_score(1, 20, bob)
+        for mid in (30, 31):
+            main.add_hookah_and_get_score(1, mid, carol)
+
+        start, end = main._prev_week_range()
+        # Make sure all entries land inside the previous week window deterministically
+        with sqlite3.connect(temp_db) as conn:
+            conn.execute("DELETE FROM hookah_log")
+            for uid, name, cnt in [(1, "@alice", 3), (2, "@bob", 1), (3, "@carol", 2)]:
+                for _ in range(cnt):
+                    conn.execute(
+                        "INSERT INTO hookah_log (chat_id, user_id, user_name, created_at) "
+                        "VALUES (1, ?, ?, ?)",
+                        (uid, name, start.isoformat()),
+                    )
+
+        name, uid, count = main.determine_period_winner(1, start, end)
+        assert (name, uid, count) == ("@bob", 2, 1)
+
+    def test_announce_weekly_sends_message_and_records_winner(self, temp_db):
+        """announce_weekly_winner messages the chat and persists the winner."""
+        alice = _make_user(1, username="alice")
+        bob = _make_user(2, username="bob")
+        main.add_hookah_and_get_score(1, 10, alice)  # 1
+        main.add_hookah_and_get_score(1, 20, bob)
+        main.add_hookah_and_get_score(1, 21, bob)    # 2
+
+        # Place the entries in the previous week so the job picks them up.
+        start, end = main._prev_week_range()
+        with sqlite3.connect(temp_db) as conn:
+            conn.execute("DELETE FROM hookah_log")
+            conn.execute(
+                "INSERT INTO hookah_log (chat_id, user_id, user_name, created_at) "
+                "VALUES (1, 1, '@alice', ?)", (start.isoformat(),)
+            )
+            conn.execute(
+                "INSERT INTO hookah_log (chat_id, user_id, user_name, created_at) "
+                "VALUES (1, 2, '@bob', ?)", (start.isoformat(),)
+            )
+            conn.execute(
+                "INSERT INTO hookah_log (chat_id, user_id, user_name, created_at) "
+                "VALUES (1, 2, '@bob', ?)", (start.isoformat(),)
+            )
+
+        context, sent = _make_context()
+        _run(main.announce_weekly_winner(context))
+
+        # One message to the chat
+        assert len(sent) == 1
+        chat_id, text = sent[0]
+        assert chat_id == 1
+        assert "прошлой недели" in text.lower()
+        assert "@alice" in text  # alice (1) is the winner — fewer hookahs
+        assert "меньше" in text.lower() or "так держать" in text.lower()
+
+        # Winner persisted for the period start -> idempotent re-run sends nothing
+        wins = main.get_win_counts(1)
+        assert wins == {1: {"week": 1}}
+
+        # Idempotent: running again must NOT send a second message
+        context2, sent2 = _make_context()
+        _run(main.announce_weekly_winner(context2))
+        assert sent2 == []
+
+    def test_announce_monthly_sends_message_and_records_winner(self, temp_db):
+        alice = _make_user(1, username="alice")
+        bob = _make_user(2, username="bob")
+        main.add_hookah_and_get_score(1, 10, alice)
+        main.add_hookah_and_get_score(1, 20, bob)
+        main.add_hookah_and_get_score(1, 21, bob)  # bob 2, alice 1
+
+        start, end = main._prev_month_range()
+        with sqlite3.connect(temp_db) as conn:
+            conn.execute("DELETE FROM hookah_log")
+            conn.execute(
+                "INSERT INTO hookah_log (chat_id, user_id, user_name, created_at) "
+                "VALUES (1, 1, '@alice', ?)", (start.isoformat(),)
+            )
+            conn.execute(
+                "INSERT INTO hookah_log (chat_id, user_id, user_name, created_at) "
+                "VALUES (1, 2, '@bob', ?)", (start.isoformat(),)
+            )
+            conn.execute(
+                "INSERT INTO hookah_log (chat_id, user_id, user_name, created_at) "
+                "VALUES (1, 2, '@bob', ?)", (start.isoformat(),)
+            )
+
+        context, sent = _make_context()
+        _run(main.announce_monthly_winner(context))
+
+        assert len(sent) == 1
+        _chat_id, text = sent[0]
+        assert "прошлого месяца" in text.lower()
+        assert "@alice" in text
+        assert main.get_win_counts(1) == {1: {"month": 1}}
+
+    def test_announce_skips_chats_with_no_activity(self, temp_db):
+        """A chat registered in hookah_stats but with no logs this period
+        receives no winner announcement."""
+        # chat 1 has stats but the previous-period window is empty for it
+        alice = _make_user(1, username="alice")
+        main.add_hookah_and_get_score(1, 10, alice)  # this week, not prev
+
+        context, sent = _make_context()
+        _run(main.announce_weekly_winner(context))
+        # No previous-week entries -> determine_period_winner returns None -> skip
+        assert sent == []
+
+
+class TestSchedulerGuards:
+    """The daily job only fires weekly on Mondays, monthly on the 1st."""
+
+    def test_is_monday_true_on_monday(self, monkeypatch):
+        monkeypatch.setattr(main, "date", _FakeDate(date(2026, 8, 3)))  # Mon
+        assert main._is_monday() is True
+        assert main._is_first_of_month() is False
+
+    def test_is_first_of_month_true_on_first(self, monkeypatch):
+        monkeypatch.setattr(main, "date", _FakeDate(date(2026, 8, 1)))
+        assert main._is_first_of_month() is True
+        assert main._is_monday() is False
+
+    def test_neither_on_mid_month_weekday(self, monkeypatch):
+        monkeypatch.setattr(main, "date", _FakeDate(date(2026, 8, 6)))  # Thu
+        assert main._is_monday() is False
+        assert main._is_first_of_month() is False
+
+
+class _FakeDate:
+    """Minimal date stand-in so _is_monday/_is_first_of_month read a fixed today.
+
+    We only implement what `date.today()` and the two guards touch.
+    """
+
+    def __init__(self, today):
+        self._today = today
+
+    def today(self):
+        return self._today
