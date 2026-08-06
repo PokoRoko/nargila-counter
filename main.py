@@ -338,10 +338,20 @@ def _place_icon(index: int) -> str:
     return f"{index + 1}."
 
 
-def format_score(rows: list[tuple[str, int]]) -> str:
+def format_score(
+    rows: list[tuple[str, int]],
+    *,
+    title: str = "📉 Общий счёт кальянов (меньше — лучше):",
+    empty_msg: str = "Пока нет записей.",
+) -> str:
+    """Render a ranked score list (anti-rating: fewer = higher place).
+
+    ``title`` / ``empty_msg`` let callers reuse this for period stats
+    (week/month) without duplicating the formatting loop.
+    """
     if not rows:
-        return "Пока нет записей."
-    lines = ["📉 Общий счёт кальянов (меньше — лучше):"]
+        return empty_msg
+    lines = [title]
     for i, (name, count) in enumerate(rows):
         icon = _place_icon(i)
         lines.append(f"{icon} {name} — {count}")
@@ -425,7 +435,17 @@ async def on_hookah_message(update: Update, _context: ContextTypes.DEFAULT_TYPE)
 
     rows, was_counted = add_hookah_and_get_score(chat.id, message.message_id, user)
     if was_counted:
-        _ = await message.reply_text(format_score(rows))
+        # After a +1, reply with the CURRENT WEEK score (not the all-time
+        # total — that's what /stats is for). Slicing to the week keeps the
+        # per-message feedback focused on the active period.
+        week_rows = get_period_score(chat.id, "week")
+        _ = await message.reply_text(
+            format_score(
+                week_rows,
+                title="📉 Счёт за эту неделю (меньше — лучше):",
+                empty_msg="На этой неделе пока нет записей.",
+            )
+        )
 
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

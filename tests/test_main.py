@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import date
+from datetime import date, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -127,6 +127,25 @@ class TestFormatScore:
     def test_uses_anti_rating_wording(self):
         out = main.format_score([("@x", 0)])
         assert "меньше" in out.lower()
+
+    def test_custom_title_and_empty_msg(self):
+        # Default empty message for the total score...
+        assert main.format_score([]) == "Пока нет записей."
+        # ...but callers (e.g. the photo handler) can override title + empty.
+        out = main.format_score(
+            [],
+            title="📉 Счёт за эту неделю (меньше — лучше):",
+            empty_msg="На этой неделе пока нет записей.",
+        )
+        assert out == "На этой неделе пока нет записей."
+
+    def test_custom_title_appears_in_output(self):
+        out = main.format_score(
+            [("@alice", 1)],
+            title="📉 Счёт за эту неделю (меньше — лучше):",
+        )
+        assert out.startswith("📉 Счёт за эту неделю")
+        assert "🥇 @alice — 1" in out
 
 
 class TestPlusOneRegex:
@@ -257,6 +276,40 @@ class TestDatabase:
         wins = main.get_win_counts(1)
         # Only the first one should be recorded
         assert wins == {1: {"week": 1}}
+
+    def test_get_period_score_week_excludes_old_entries(self, temp_db):
+        """get_period_score('week') must only count the current week,
+        not the all-time history. This is the guarantee the photo handler
+        relies on when showing 'score for this week'."""
+        alice = _make_user(1, username="alice")
+        bob = _make_user(2, username="bob")
+        # Two real +1's this week (logged under created_at=now by default)
+        main.add_hookah_and_get_score(1, 10, alice)
+        main.add_hookah_and_get_score(1, 11, alice)
+        main.add_hookah_and_get_score(1, 20, bob)
+        # Inject an OLD log entry (2 weeks ago) that must be ignored.
+        week_start = main._week_start()
+        two_weeks_ago = (week_start - timedelta(weeks=2)).isoformat()
+        with sqlite3.connect(temp_db) as conn:
+            conn.execute(
+                "INSERT INTO hookah_log (chat_id, user_id, user_name, created_at) "
+                "VALUES (1, 1, '@alice', ?)",
+                (two_weeks_ago,),
+            )
+        rows = dict(main.get_period_score(1, "week"))
+        # Alice: 2 this week (old one excluded), bob: 1 this week.
+        assert rows == {"@alice": 2, "@bob": 1}
+
+    def test_get_period_score_week_is_anti_rating_order(self, temp_db):
+        alice = _make_user(1, username="alice")
+        bob = _make_user(2, username="bob")
+        for mid in (10, 11, 12):
+            main.add_hookah_and_get_score(1, mid, alice)  # 3
+        main.add_hookah_and_get_score(1, 20, bob)  # 1
+        rows = main.get_period_score(1, "week")
+        # bob (1) above alice (3) — fewer hookahs ranks first
+        assert rows[0] == ("@bob", 1)
+        assert rows[1] == ("@alice", 3)
 
     def test_wal_mode_enabled(self, temp_db):
         with sqlite3.connect(temp_db) as conn:
