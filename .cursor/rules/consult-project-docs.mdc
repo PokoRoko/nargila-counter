@@ -1,0 +1,61 @@
+---
+description: Consult project AI documentation before coding, refactoring, or answering architecture questions in nargila-counter
+alwaysApply: true
+---
+
+# Project Documentation First
+
+Before making code changes, planning features, or answering architecture
+questions in **nargila-counter** (the Telegram anti-rating hookah counter):
+
+## 1. Read project docs first
+
+Consult these files in `docs/` in order of relevance:
+
+| File | Use when |
+|------|----------|
+| `docs/agent-rules.md` | Any code change — layer boundaries, behaviour rules, deploy constraints |
+| `docs/architecture.md` | Structure, patterns, ownership, technical debt |
+| `docs/domain.md` | Entities, invariants, anti-rating rules, extension points |
+| `docs/api.md` | Telegram command/message surface (no HTTP API) |
+| `docs/database.md` | Schema (4 tables), repository functions, transaction boundaries |
+| `docs/workers.md` | The daily 00:00 scheduler, weekly/monthly winner announcement |
+| `docs/integrations.md` | Telegram Bot API + SQLite + env vars |
+| `docs/request-flows.md` | End-to-end sequences (photo +1, /stats, scheduled announcement) |
+
+Search or read the smallest set of docs needed for the current task. Do **not**
+skip `docs/agent-rules.md` for substantive changes.
+
+## 2. Follow documented patterns
+
+- Keep SQL inside the repository functions listed in `docs/database.md`; handlers
+  must not write raw SQL.
+- Keep the functional core (`_week_start`, `format_score`, `_plurals_count`, …)
+  free of `sqlite3`/`telegram` imports and I/O.
+- Preserve the anti-rating ordering (`ORDER BY count ASC, user_name ASC`) and the
+  "photo +1 → weekly reply" / "`/stats` → all-time + wins" split (rules 6–8).
+- `init_db()` must stay idempotent (`CREATE TABLE IF NOT EXISTS`); destructive
+  schema changes ship as one-off scripts, not edits to `init_db()`.
+
+## 3. Global and user rules
+
+User-level and global Cursor rules apply **only when**:
+
+- They do not conflict with project documentation, **or**
+- The current task explicitly requires them (e.g. user asked for a git commit,
+  pull request, or a specific tool workflow such as `casaos-deploy`).
+
+## 4. On conflict
+
+**Project documentation wins** for architecture, domain logic, module
+boundaries, the anti-rating invariant, and deploy/volume conventions. If a
+global rule conflicts, follow the project docs and note the conflict to the
+user.
+
+## 5. Missing or stale docs
+
+If documentation is missing, incomplete, or contradicts the code:
+
+1. State assumptions explicitly before proceeding.
+2. Prefer reading source (`main.py` + `tests/test_main.py`) over guessing.
+3. Offer to update the relevant doc after the change.
