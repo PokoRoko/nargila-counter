@@ -124,9 +124,13 @@ class TestFormatScore:
         assert "🥇 @alice — 1" in out
         assert "🥈 @bob — 3" in out
 
-    def test_uses_anti_rating_wording(self):
+    def test_default_title_has_no_anti_rating_clarifier(self):
+        # "меньше — лучше" was removed by design; the default title is now
+        # just the leaderboard name. Lock this in so the clarifier doesn't
+        # silently creep back.
         out = main.format_score([("@x", 0)])
-        assert "меньше" in out.lower()
+        assert "меньше" not in out.lower()
+        assert out.startswith("📉 Общий счёт кальянов:")
 
     def test_custom_title_and_empty_msg(self):
         # Default empty message for the total score...
@@ -134,7 +138,7 @@ class TestFormatScore:
         # ...but callers (e.g. the photo handler) can override title + empty.
         out = main.format_score(
             [],
-            title="📉 Счёт за эту неделю (меньше — лучше):",
+            title="📉 Эта неделя (4–10 авг):",
             empty_msg="На этой неделе пока нет записей.",
         )
         assert out == "На этой неделе пока нет записей."
@@ -142,10 +146,71 @@ class TestFormatScore:
     def test_custom_title_appears_in_output(self):
         out = main.format_score(
             [("@alice", 1)],
-            title="📉 Счёт за эту неделю (меньше — лучше):",
+            title="📉 Эта неделя (4–10 авг):",
         )
-        assert out.startswith("📉 Счёт за эту неделю")
+        assert out.startswith("📉 Эта неделя (4–10 авг)")
         assert "🥇 @alice — 1" in out
+
+    def test_highlight_user_wraps_only_that_user_in_bold(self):
+        """highlight_user must wrap exactly that one row in <b>...</b>;
+        everyone else stays plain (HTML output)."""
+        out = main.format_score(
+            [("@alice", 1), ("@bob", 3)],
+            highlight_user="@alice",
+        )
+        assert "🥇 <b>@alice</b> — 1" in out
+        # bob is not highlighted
+        assert "🥈 @bob — 3" in out
+        assert "<b>@bob</b>" not in out
+
+    def test_highlight_user_none_means_no_bold(self):
+        """Without highlight_user there must be no <b> tags at all."""
+        out = main.format_score([("@alice", 1)])
+        assert "<b>" not in out
+
+    def test_deltas_append_plus_n_only_for_positive(self):
+        """deltas={name: n} appends '(+n)' to that row; zero/negative are omitted."""
+        out = main.format_score(
+            [("@alice", 5), ("@bob", 1)],
+            deltas={"@alice": 2, "@bob": 0},
+        )
+        assert "🥇 @alice — 5 (+2)" in out
+        # bob's delta is 0 -> no suffix
+        assert "🥈 @bob — 1" in out
+        assert "(+0)" not in out
+
+    def test_html_escaping_in_names(self):
+        """Usernames containing HTML metacharacters must be escaped so HTML
+        parse_mode doesn't break and the literal name is shown."""
+        # A user named (hypothetically) "<x>" with no @ handle path
+        out = main.format_score([("<script>", 1)])
+        assert "<b>" not in out.split("\n", 1)[1]  # only our own tags allowed
+        assert "&lt;script&gt;" in out
+
+
+class TestFormatDateRange:
+    """_format_date_range renders inclusive day ranges in Russian."""
+
+    def test_same_month_uses_day_dash_day(self):
+        aug4 = date(2026, 8, 4)   # Tuesday
+        aug10 = date(2026, 8, 10)
+        assert main._format_date_range(aug4, aug10) == "4–10 авг"
+
+    def test_crosses_month_boundary(self):
+        jul28 = date(2026, 7, 28)
+        aug3 = date(2026, 8, 3)
+        assert main._format_date_range(jul28, aug3) == "28 июл – 3 авг"
+
+    def test_single_day_same_month(self):
+        # When start == end (single-day range), the same-month branch still
+        # produces a valid label like "1–1 авг".
+        first = date(2026, 8, 1)
+        assert main._format_date_range(first, first) == "1–1 авг"
+
+    def test_month_name_picked_correctly_per_month(self):
+        # Sanity: a January range and a December range pick the right label.
+        assert main._format_date_range(date(2026, 1, 5), date(2026, 1, 11)) == "5–11 янв"
+        assert main._format_date_range(date(2026, 12, 7), date(2026, 12, 13)) == "7–13 дек"
 
 
 class TestPlusOneRegex:
@@ -399,7 +464,7 @@ def _make_context(*, args=None, bot=None):
     sent: list[tuple[int, str]] = []
 
     class _Bot:
-        async def send_message(self, chat_id, text):
+        async def send_message(self, chat_id, text, **_kwargs):
             sent.append((chat_id, text))
             return None
 
@@ -419,10 +484,12 @@ class TestPhotoHandlerShowsWeeklyScore:
 
         assert len(replies) == 1
         reply = replies[0]
-        # Weekly title, NOT the all-time "Общий счёт" one
-        assert "эту неделю" in reply.lower()
+        # Weekly title, NOT the all-time "Общий счёт" one. New wording uses
+        # nominative "Эта неделя" plus an inclusive date range in parentheses.
+        assert "эта неделя" in reply.lower()
         assert "общий счёт" not in reply.lower()
-        assert "🥇 @alice — 1" in reply
+        # Author is highlighted in HTML bold; everyone else stays plain.
+        assert "🥇 <b>@alice</b> — 1" in reply
 
     def test_photo_reply_excludes_old_weeks(self, temp_db):
         """A +1 from 2 weeks ago must not appear in the weekly reply."""
@@ -462,7 +529,8 @@ class TestPhotoHandlerShowsWeeklyScore:
 
         reply = replies[0]
         # This week: alice 2 (old excluded), bob 3. Alice ranks first (anti-rating).
-        assert "🥇 @alice — 2" in reply
+        # Alice is the highlighted author (last +1) -> bold; bob stays plain.
+        assert "🥇 <b>@alice</b> — 2" in reply
         assert "🥈 @bob — 3" in reply
         # And it must NOT show the cumulative total (alice 2, not alice 3+)
         assert "🥉" not in reply  # only 2 users this week
@@ -501,6 +569,48 @@ class TestPhotoHandlerShowsWeeklyScore:
         _run(main.on_hookah_message(second[0], context))  # no extra reply
         assert len(first[2]) == 1
         assert second[2] == []
+
+    def test_photo_reply_has_date_range_in_title(self, temp_db):
+        """The weekly title carries an inclusive date range so chatters know
+        exactly which week the score covers."""
+        user = _make_user(100, username="alice")
+        update, _msg, replies = _make_msg(
+            chat_id=1, message_id=10, user=user, photo=True, caption="+1"
+        )
+        context, _ = _make_context()
+        _run(main.on_hookah_message(update, context))
+
+        reply = replies[0]
+        week_start = main._week_start()
+        week_end = week_start + timedelta(days=6)
+        expected_range = main._format_date_range(week_start, week_end)
+        assert f"({expected_range})" in reply
+
+    def test_photo_reply_is_html_with_bold_author(self, temp_db):
+        """The reply must be valid HTML (so parse_mode=HTML is set on the
+        reply_text call) and wrap the +1 author in <b>...</b>."""
+        user = _make_user(100, username="alice")
+        # Capture kwargs passed to reply_text to assert parse_mode=HTML.
+        captured: dict = {}
+
+        async def _spy_reply(text, **kwargs):
+            captured["text"] = text
+            captured["kwargs"] = kwargs
+            return None
+
+        update = SimpleNamespace(
+            effective_message=SimpleNamespace(
+                message_id=10, from_user=user, chat=SimpleNamespace(id=1),
+                text="", caption="+1", photo=["x"], document=None,
+                reply_text=_spy_reply,
+            ),
+            effective_chat=SimpleNamespace(id=1),
+        )
+        context, _ = _make_context()
+        _run(main.on_hookah_message(update, context))
+
+        assert captured["kwargs"].get("parse_mode") == "HTML"
+        assert "<b>@alice</b>" in captured["text"]
 
 
 class TestStatsCommand:
@@ -548,10 +658,40 @@ class TestStatsCommand:
 
         out = replies[0]
         assert "Победы" in out
-        # Each user gets one line showing BOTH week and month win counts
-        # (zeros included), e.g. "@alice: недель — 1, месяцев — 0".
-        assert "@alice: недель — 1, месяцев — 0" in out
-        assert "@bob: недель — 0, месяцев — 1" in out
+        # Compact wins format: one entry per winning user joined by ' | ',
+        # showing both week and month counts separated by '·' (zeros included),
+        # sorted by total wins desc. e.g. "@alice: 1 нед · 0 мес | @bob: 0 нед · 1 мес".
+        assert "@alice: 1 нед · 0 мес" in out
+        assert "@bob: 0 нед · 1 мес" in out
+        # Both winners fit on one line, separated by a pipe.
+        assert " | " in out.split("Победы")[1]
+
+    def test_stats_wins_block_sorted_by_total_desc(self, temp_db):
+        """The compact wins block lists users by total wins (week + month)
+        descending, so the most-decorated user appears first."""
+        alice = _make_user(1, username="alice")
+        bob = _make_user(2, username="bob")
+
+        main.add_hookah_and_get_score(1, 10, alice)
+        main.add_hookah_and_get_score(1, 20, bob)
+
+        # Alice: 3 weekly wins + 1 monthly. Bob: 1 monthly (different period_start
+        # so it doesn't collide with alice's row on the period_winners PK).
+        for start in ("2026-01-05", "2026-01-12", "2026-01-19"):
+            main.save_period_winner(1, "week", start, 1, "@alice", 1)
+        main.save_period_winner(1, "month", "2026-01-01", 1, "@alice", 1)
+        main.save_period_winner(1, "month", "2026-02-01", 2, "@bob", 1)
+
+        update, _m, replies = _make_msg(chat_id=1, message_id=99, user=alice)
+        context, _ = _make_context(args=[])
+        _run(main.stats(update, context))
+
+        wins_line = replies[0].split("Победы")[1].strip()
+        # Alice (4 total) must come before bob (1 total).
+        assert wins_line.index("@alice") < wins_line.index("@bob")
+        # And the compact format is used.
+        assert "3 нед · 1 мес" in wins_line
+        assert "0 нед · 1 мес" in wins_line
 
     def test_stats_omits_win_section_when_no_winners(self, temp_db):
         """No period_winners rows -> no 'Победы' section at all."""
@@ -572,7 +712,8 @@ class TestStatsCommand:
         context, _ = _make_context(args=["week"])
         _run(main.stats(update, context))
 
-        assert "текущую неделю" in replies[0].lower()
+        # New wording uses nominative "текущая неделя" + an inclusive date range.
+        assert "текущая неделя" in replies[0].lower()
         assert "🥇 @alice — 1" in replies[0]
 
     def test_stats_month_arg_shows_monthly(self, temp_db):
@@ -592,7 +733,7 @@ class TestStatsCommand:
         update, _m, replies = _make_msg(chat_id=1, message_id=99, user=alice)
         context, _ = _make_context(args=[alias])
         _run(main.stats(update, context))
-        assert "текущую неделю" in replies[0].lower()
+        assert "текущая неделя" in replies[0].lower()
 
     @pytest.mark.parametrize("alias", ["m", "month", "месяц", "мес"])
     def test_month_aliases_accepted(self, temp_db, alias):

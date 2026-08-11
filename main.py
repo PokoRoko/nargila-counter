@@ -338,24 +338,98 @@ def _place_icon(index: int) -> str:
     return f"{index + 1}."
 
 
+def _html_escape(text: str) -> str:
+    """Escape HTML metacharacters for ParseMode.HTML output."""
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+_MONTHS_RU = [
+    "янв", "фев", "мар", "апр", "мая", "июн",
+    "июл", "авг", "сен", "окт", "ноя", "дек",
+]
+
+
+def _format_date_range(start: date, end: date) -> str:
+    """Render an inclusive day range in Russian, e.g. '4–10 авг' or '28 июл – 3 авг'.
+
+    Same month: '4–10 авг'. Different months: '28 июл – 3 авг'.
+    Different years (rare around New Year): '30 дек – 3 янв'.
+    """
+    start_label = f"{start.day} {_MONTHS_RU[start.month - 1]}"
+    end_label = f"{end.day} {_MONTHS_RU[end.month - 1]}"
+    if start.month == end.month and start.year == end.year:
+        return f"{start.day}–{end.day} {_MONTHS_RU[end.month - 1]}"
+    return f"{start_label} – {end_label}"
+
+
 def format_score(
     rows: list[tuple[str, int]],
     *,
-    title: str = "📉 Общий счёт кальянов (меньше — лучше):",
+    title: str = "📉 Общий счёт кальянов:",
     empty_msg: str = "Пока нет записей.",
+    highlight_user: str | None = None,
+    deltas: dict[str, int] | None = None,
 ) -> str:
     """Render a ranked score list (anti-rating: fewer = higher place).
 
-    ``title`` / ``empty_msg`` let callers reuse this for period stats
-    (week/month) without duplicating the formatting loop.
+    Output uses Telegram HTML so usernames with ``_``, ``*``, ``[`` render
+    literally without escaping headaches for the caller.
+
+    - ``title`` / ``empty_msg`` let callers reuse this for period stats
+      (week/month) without duplicating the formatting loop.
+    - ``highlight_user``: if set, that user's row is wrapped in ``<b>…</b>``
+      (used by the photo handler to highlight whoever just sent +1).
+    - ``deltas``: optional ``{user_name: plus_n_since_period_start}``; when
+      provided and ``plus_n > 0``, a ``(+N)`` suffix is appended to that row.
     """
     if not rows:
         return empty_msg
+    deltas = deltas or {}
     lines = [title]
     for i, (name, count) in enumerate(rows):
         icon = _place_icon(i)
-        lines.append(f"{icon} {name} — {count}")
+        escaped = _html_escape(name)
+        body = f"<b>{escaped}</b>" if name == highlight_user else escaped
+        line = f"{icon} {body} — {count}"
+        delta = deltas.get(name, 0)
+        if delta > 0:
+            line += f" (+{delta})"
+        lines.append(line)
     return "\n".join(lines)
+
+
+def _format_wins_block(chat_id: int, win_counts: dict[int, dict[str, int]]) -> str:
+    """Compact one-line '🏆 Победы' block, or '' when there are no winners.
+
+    Sorted by total wins (week + month) desc so the most-decorated users appear
+    first. Format:
+        🏆 Победы:\\n@bob: 3 нед · 1 мес | @alice: 1 нед · 0 мес
+
+    All names HTML-escaped for ParseMode.HTML.
+    """
+    if not win_counts:
+        return ""
+
+    rows: list[tuple[str, int, int, int]] = []
+    for _uid, name, _total in get_score_with_user_ids(chat_id):
+        w = win_counts.get(_uid, {})
+        week_wins = w.get("week", 0)
+        month_wins = w.get("month", 0)
+        if week_wins or month_wins:
+            rows.append((name, week_wins, month_wins, week_wins + month_wins))
+    if not rows:
+        return ""
+    rows.sort(key=lambda r: (-r[3], r[0]))
+
+    pieces = [
+        f"{_html_escape(name)}: {wk} нед · {mo} мес"
+        for name, wk, mo, _total in rows
+    ]
+    return "🏆 Победы:\n" + " | ".join(pieces)
 
 
 def _week_start(d: date | None = None) -> date:
@@ -439,12 +513,17 @@ async def on_hookah_message(update: Update, _context: ContextTypes.DEFAULT_TYPE)
         # total — that's what /stats is for). Slicing to the week keeps the
         # per-message feedback focused on the active period.
         week_rows = get_period_score(chat.id, "week")
+        week_start = _week_start()
+        date_range = _format_date_range(week_start, week_start + timedelta(days=6))
+        author_name = get_user_name(user)
         _ = await message.reply_text(
             format_score(
                 week_rows,
-                title="📉 Счёт за эту неделю (меньше — лучше):",
+                title=f"📉 Эта неделя ({date_range}):",
                 empty_msg="На этой неделе пока нет записей.",
-            )
+                highlight_user=author_name,
+            ),
+            parse_mode=ParseMode.HTML,
         )
 
 
@@ -458,68 +537,67 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     period = (context.args[0].lower() if context.args else "").strip()
     if period in {"w", "week", "неделя", "неделю", "нед"}:
         rows = get_period_score(chat.id, "week")
-        title = "📉 Счёт за текущую неделю (меньше — лучше):"
+        week_start = _week_start()
+        date_range = _format_date_range(week_start, week_start + timedelta(days=6))
+        title = f"📉 Текущая неделя ({date_range}):"
     elif period in {"m", "month", "месяц", "мес"}:
         rows = get_period_score(chat.id, "month")
-        title = "📉 Счёт за текущий месяц (меньше — лучше):"
+        month_start = _month_start()
+        date_range = _format_date_range(month_start, month_start + timedelta(days=0))
+        title = f"📉 Текущий месяц ({date_range}):"
     else:
         total_rows = get_score(chat.id)
         if not total_rows:
             _ = await message.reply_text("Пока нет записей.")
             return
 
+        # Show "+N" weekly deltas next to each all-time count so a glance at
+        # /stats reveals who is smoking a lot *right now*.
+        weekly_deltas = dict(get_period_score(chat.id, "week"))
+
         win_counts = get_win_counts(chat.id)
-        lines = [format_score(total_rows)]
-
-        if win_counts:
-            lines.append("")
-            lines.append("🏆 Победы (анти-рейтинг — кто выкурил меньше всех):")
-            for uid, name, _total in get_score_with_user_ids(chat.id):
-                w = win_counts.get(uid, {})
-                week_wins = w.get("week", 0)
-                month_wins = w.get("month", 0)
-                if week_wins or month_wins:
-                    lines.append(
-                        f"  • {name}: недель — {week_wins}, месяцев — {month_wins}"
-                    )
-
-        _ = await message.reply_text("\n".join(lines))
+        lines = [
+            format_score(total_rows, deltas=weekly_deltas),
+            _format_wins_block(chat.id, win_counts),
+        ]
+        _ = await message.reply_text(
+            "\n".join(line for line in lines if line),
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     if not rows:
         _ = await message.reply_text("За этот период записей пока нет.")
         return
-    lines = [title]
-    for i, (name, count) in enumerate(rows):
-        icon = _place_icon(i)
-        lines.append(f"{icon} {name} — {count}")
-    _ = await message.reply_text("\n".join(lines))
+    _ = await message.reply_text(
+        format_score(rows, title=title),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 HELP_TEXT = (
-    "🪔 *Nargila Counter* — анти-рейтинг кальянов в чате.\n\n"
-    "Чем *меньше* ты куришь, тем выше ты в рейтинге 🥇.\n\n"
-    "*Команды:*\n"
+    "🪔 <b>Nargila Counter</b> — анти-рейтинг кальянов в чате.\n\n"
+    "<b>Команды:</b>\n"
     "/stats — общий счёт и победители за неделю/месяц\n"
     "/stats week — счёт за текущую неделю\n"
     "/stats month — счёт за текущий месяц\n"
     "/help — эта справка\n\n"
-    "*Как засчитать кальян:*\n"
-    "Пришли фото с подписью `+1` — бот добавит +1 в твой счёт."
+    "<b>Как засчитать кальян:</b>\n"
+    "Пришли фото с подписью <code>+1</code> — бот добавит +1 в твой счёт."
 )
 
 
 async def start(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_message:
         _ = await update.effective_message.reply_text(
-            HELP_TEXT, parse_mode=ParseMode.MARKDOWN
+            HELP_TEXT, parse_mode=ParseMode.HTML
         )
 
 
 async def help_command(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_message:
         _ = await update.effective_message.reply_text(
-            HELP_TEXT, parse_mode=ParseMode.MARKDOWN
+            HELP_TEXT, parse_mode=ParseMode.HTML
         )
 
 
@@ -564,11 +642,14 @@ async def _announce_period_winner(
         word = _plurals_count(count, ("кальян", "кальяна", "кальянов"))
         text = (
             f"{intro}\n"
-            f"Победитель: {user_name} — выкурил меньше всех, всего {count} {word}.\n"
+            f"Победитель: <b>{_html_escape(user_name)}</b> — "
+            f"выкурил меньше всех, всего {count} {word}.\n"
             f"Так держать! 🌿"
         )
         try:
-            _ = await context.bot.send_message(chat_id=chat_id, text=text)
+            _ = await context.bot.send_message(
+                chat_id=chat_id, text=text, parse_mode=ParseMode.HTML
+            )
             logger.info(
                 "Announced %s winner for chat_id=%s: %s",
                 period_type,
